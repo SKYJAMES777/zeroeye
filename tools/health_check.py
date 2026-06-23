@@ -200,7 +200,7 @@ def check_load_average() -> Tuple[str, str, float]:
 # HEALTH CHECK RUNNER
 # ---------------------------------------------------------------------------
 
-def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
+def run_health_checks(service: Optional[str] = None, json_output: bool = False, timeout_override: Optional[int] = None) -> Dict[str, Any]:
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "hostname": socket.gethostname(),
@@ -232,7 +232,8 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     for name, config in INFRASTRUCTURE.items():
         if service and name != service:
             continue
-        status, detail, latency = check_tcp_port(config["host"], config["port"], config["timeout"])
+        infra_timeout = timeout_override if timeout_override is not None else config["timeout"]
+        status, detail, latency = check_tcp_port(config["host"], config["port"], infra_timeout)
         results["infrastructure"][name] = {
             "status": status,
             "detail": detail,
@@ -307,26 +308,34 @@ def parse_args():
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--output", "-o", help="Output file path")
+    parser.add_argument("--timeout", "-t", type=int, default=None, help="Per-service timeout override (seconds)")
+    parser.add_argument("--rate-limit", "-r", type=float, default=0, help="Minimum interval between consecutive checks (seconds)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    _last_check_time = 0.0
 
     if args.watch:
         print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
         try:
             while True:
-                results = run_health_checks(args.service, args.json)
+                results = run_health_checks(args.service, args.json, timeout_override=args.timeout)
                 if args.json:
                     print(json.dumps(results, indent=2))
                 else:
                     print_health_report(results)
+                if args.rate_limit > 0:
+                    elapsed = time.time() - _last_check_time
+                    if elapsed < args.rate_limit:
+                        time.sleep(args.rate_limit - elapsed)
+                _last_check_time = time.time()
                 time.sleep(args.interval)
         except KeyboardInterrupt:
             print("\nMonitoring stopped")
     else:
-        results = run_health_checks(args.service, args.json)
+        results = run_health_checks(args.service, args.json, timeout_override=args.timeout)
         if args.json:
             output = json.dumps(results, indent=2)
             print(output)
