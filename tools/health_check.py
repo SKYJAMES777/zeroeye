@@ -40,6 +40,7 @@ import sys
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+import random
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -68,29 +69,44 @@ MEMORY_THRESHOLD_CRITICAL = 90
 # CHECK FUNCTIONS
 # ---------------------------------------------------------------------------
 
-def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
+def check_http_service(host: str, port: int, path: str, timeout: int,
+                         max_retries: Optional[int] = None,
+                         base_delay: float = RETRY_BASE_DELAY,
+                         max_delay: float = RETRY_MAX_DELAY) -> Tuple[str, str, int]:
     import http.client
-    try:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-        conn.request("GET", path)
-        resp = conn.getresponse()
-        status = resp.status
-        body = resp.read().decode("utf-8", errors="replace")[:200]
-        conn.close()
+    import random
 
-        if status == 200:
-            result = "OK"
-            detail = f"HTTP {status}"
-        elif status < 500:
-            result = "WARNING"
-            detail = f"HTTP {status}: {body[:100]}"
-        else:
-            result = "CRITICAL"
-            detail = f"HTTP {status}: {body[:100]}"
+    retries = max_retries if max_retries is not None else 0
+    last_error = ""
 
-        return result, detail, status
-    except Exception as e:
-        return "CRITICAL", str(e), 0
+    for attempt in range(retries + 1):
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            status = resp.status
+            body = resp.read().decode("utf-8", errors="replace")[:200]
+            conn.close()
+
+            if status == 200:
+                result = "OK"
+                detail = f"HTTP {status}"
+            elif status < 500:
+                result = "WARNING"
+                detail = f"HTTP {status}: {body[:100]}"
+            else:
+                result = "CRITICAL"
+                detail = f"HTTP {status}: {body[:100]}"
+
+            return result, detail, status
+        except Exception as e:
+            last_error = str(e)
+            if attempt < retries:
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                jitter = random.uniform(0, delay * RETRY_JITTER)
+                time.sleep(delay + jitter)
+
+    return "CRITICAL", f"After {retries + 1} attempts: {last_error}", 0
 
 
 def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
@@ -216,9 +232,33 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     for name, config in SERVICES.items():
         if service and name != service:
             continue
+        # Circuit breaker check
+        cb = _circuit_state.get(name, {})
+        if cb.get("open", False):
+            elapsed = time.time() - cb.get("last_failure", 0)
+            if elapsed > CIRCUIT_BREAKER_RESET_TIMEOUT:
+                cb["open"] = False
+                cb["failures"] = 0
+                _circuit_state[name] = cb
+            else:
+                results["services"][name] = {
+                    "status": "CRITICAL",
+                    "detail": f"Circuit breaker open ({CIRCUIT_BREAKER_RESET_TIMEOUT - elapsed:.0f}s remaining)",
+                    "code": 0,
+                    "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
+                }
+                all_ok = False
+                continue
         status, detail, code = check_http_service(
-            config["host"], config["port"], config["path"], config["timeout"]
+            config["host"], config["port"], config["path"], config["timeout"],
+            max_retries=RETRY_MAX_ATTEMPTS
         )
+        if status == "CRITICAL":
+            _circuit_state.setdefault(name, {"failures": 0, "last_failure": 0, "open": False})
+            _circuit_state[name]["failures"] += 1
+            _circuit_state[name]["last_failure"] = time.time()
+            if _circuit_state[name]["failures"] >= CIRCUIT_BREAKER_THRESHOLD:
+                _circuit_state[name]["open"] = True
         results["services"][name] = {
             "status": status,
             "detail": detail,
